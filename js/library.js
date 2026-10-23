@@ -96,16 +96,32 @@ function fieldValue(path, c, groups) {
   return group.multi ? `[${picked.join(', ')}]` : (picked[0] || '""');
 }
 
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Body sections the template asks to be filled: every `##`/`###` heading
+ * followed by a `<!-- hint -->` comment. → [{ heading, hint }]
+ */
+export function templateSections(template) {
+  return [...template.matchAll(/^#{2,3} (.+)\n<!--([\s\S]*?)-->/gm)]
+    .map(([, heading, hint]) => ({ heading: heading.trim(), hint: hint.replace(/\s+/g, ' ').trim() }));
+}
+
+// Writes text under a heading, after its hint comment. A lone "-" line is
+// the template's empty-list placeholder and gets replaced. Headings the
+// template doesn't have are appended at the end.
 function fillSection(md, heading, text) {
   if (!text?.trim()) return md;
-  const re = new RegExp(`^## ${heading}\\n(?:<!--[\\s\\S]*?-->\\n)?`, 'm');
-  return md.replace(re, (m) => `${m}${text.trim()}\n`);
+  const re = new RegExp(`^(#{2,3} ${escapeRe(heading)}\\n(?:<!--[\\s\\S]*?-->\\n)?)(?:-\\n)?`, 'm');
+  return re.test(md)
+    ? md.replace(re, (_, head) => `${head}${text.trim()}\n`)
+    : `${md.replace(/\n*$/, '\n')}\n## ${heading}\n${text.trim()}\n`;
 }
 
 /**
  * Fills the case template. Only values change; keys, order and comments
  * stay exactly as the template has them.
- * c: { id, title, product, url, captured, tags, fit, rating, images, context, like }
+ * c: { id, title, product, url, captured, tags, fit, rating, images, sections: { heading: text } }
  */
 export function buildCaseMd(template, groups, c) {
   const lines = template.split('\n');
@@ -129,5 +145,5 @@ export function buildCaseMd(template, groups, c) {
     const value = fieldValue(indent ? `${parent}.${key}` : key, c, groups);
     out.push(value === undefined ? line : withComment(`${indent}${key}: ${value}`, line));
   });
-  return fillSection(fillSection(out.join('\n'), 'Context', c.context), 'What I like', c.like);
+  return Object.entries(c.sections || {}).reduce((md, [heading, text]) => fillSection(md, heading, text), out.join('\n'));
 }

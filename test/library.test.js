@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  parseTaxonomy, tagGroups, parseCaseMeta, buildCaseMd, nextCaseNumber, caseId, slugify,
+  parseTaxonomy, tagGroups, templateSections, parseCaseMeta, buildCaseMd, nextCaseNumber, caseId, slugify,
 } from '../js/library.js';
 
 const TAXONOMY = `# Controlled vocabulary
@@ -48,6 +48,14 @@ status: draft                  # draft | reviewed | synthesized
 <!-- Name the exact decision. -->
 
 ## Breakdown
+
+### Color
+<!-- Surfaces and accents.
+     Approximate hex values. -->
+
+## Principle candidates
+<!-- 1–3 rules. -->
+-
 `;
 
 const groups = tagGroups(TEMPLATE, parseTaxonomy(TAXONOMY));
@@ -64,7 +72,13 @@ test('buildCaseMd fills values and keeps comments and body', () => {
     id: 'v-0012', title: 'Fleet table with "status" chips', product: 'Formant', url: '',
     captured: '2026-10-23', tags: { 'screen-type': ['table-list', 'monitoring'], domain: ['industrial'] },
     fit: 'extends', rating: 4, images: ['shot-01.png', 'shot-02.webp'],
-    context: 'Operators scan fleet health.', like: '',
+    sections: {
+      Context: 'Operators scan fleet health.',
+      'What I like': '',
+      Color: 'Neutral surfaces; status is the only color.',
+      'Principle candidates': '- Put status in its own column.',
+      'Open questions': '- Does the row expand on click?',
+    },
   });
   const lines = md.split('\n');
   assert.equal(lines[1], 'id: v-0012                     # v-<4-digit sequence>');
@@ -75,6 +89,18 @@ test('buildCaseMd fills values and keeps comments and body', () => {
   assert.ok(md.includes('rating: 4                      # 1–5'));
   assert.ok(md.includes('<!-- What task does this screen support? -->\nOperators scan fleet health.\n'));
   assert.ok(md.includes('## What I like\n<!-- Name the exact decision. -->\n\n## Breakdown'));
+  assert.ok(md.includes('Approximate hex values. -->\nNeutral surfaces; status is the only color.\n'));
+  assert.ok(md.includes('<!-- 1–3 rules. -->\n- Put status in its own column.\n'));
+  assert.ok(md.endsWith('\n\n## Open questions\n- Does the row expand on click?\n'));
+});
+
+test('templateSections lists fillable headings with their hints', () => {
+  assert.deepEqual(templateSections(TEMPLATE), [
+    { heading: 'Context', hint: 'What task does this screen support?' },
+    { heading: 'What I like', hint: 'Name the exact decision.' },
+    { heading: 'Color', hint: 'Surfaces and accents. Approximate hex values.' },
+    { heading: 'Principle candidates', hint: '1–3 rules.' },
+  ]);
 });
 
 test('parseCaseMeta reads quoted and plain values', () => {

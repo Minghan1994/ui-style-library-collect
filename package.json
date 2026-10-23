@@ -3,6 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "vendor": "esbuild node_modules/@anthropic-ai/sdk/index.mjs --bundle --format=esm --platform=browser --minify --legal-comments=eof --outfile=js/vendor/anthropic-sdk.js"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "0.132.1",
+    "esbuild": "0.28.2"
   }
 }

@@ -193,3 +193,9 @@ dialog pre { margin: 0; padding: 16px 20px; overflow: auto; max-height: calc(100
 .row.spread { justify-content: space-between; }
 .link-text { color: var(--primary); }
 .btn.btn-inline { height: auto; padding: 0 2px; }
+
+/* Analysis */
+.analyze { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border); }
+.claude-key { display: flex; flex-direction: column; gap: 8px; margin-top: 12px; padding: 12px; border-radius: var(--r-md); background: var(--s2); }
+.input.grow { flex: 1; min-width: 200px; width: auto; }
+.section-list { display: flex; flex-direction: column; gap: 16px; }

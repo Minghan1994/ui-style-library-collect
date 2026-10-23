@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<!-- The token lives in this page: only our own files may run, and data may go only to api.github.com. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src blob:; connect-src https://api.github.com; base-uri 'none'; form-action 'none'">
+<!-- Tokens live in this page: only our own files may run, and data may go only to GitHub and Anthropic. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src blob:; connect-src https://api.github.com https://api.anthropic.com; base-uri 'none'; form-action 'none'">
 <meta name="referrer" content="no-referrer">
 <title>Collect a Case</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
@@ -70,6 +70,21 @@
         </div>
         <input id="file" type="file" accept="image/*" multiple hidden>
         <div id="shots" class="shots"></div>
+        <div class="analyze">
+          <button id="analyze-btn" class="btn btn-outlined" disabled><span class="icon">auto_awesome</span>Analyze with Claude</button>
+          <span id="analyze-hint" class="caption muted"></span>
+          <button id="forget-key" class="btn btn-text btn-inline caption" hidden>Forget API key</button>
+        </div>
+        <div id="claude-key" class="claude-key" hidden>
+          <label class="field">
+            <span class="label muted">Anthropic API key</span>
+            <div class="row">
+              <input id="anthropic-key" class="input grow" type="password" placeholder="sk-ant-…" autocomplete="off" spellcheck="false">
+              <button id="save-key" class="btn btn-outlined">Save and analyze</button>
+            </div>
+          </label>
+          <p class="caption muted">Create one at <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener noreferrer">console.anthropic.com → API keys</a>. Usage is billed to your Anthropic account. The key stays in this browser and is sent only to api.anthropic.com.</p>
+        </div>
       </section>
 
       <section class="card" aria-labelledby="h-source">
@@ -113,10 +128,18 @@
         <p id="tag-desc" class="caption muted tag-desc"></p>
       </section>
 
+      <section class="card" aria-labelledby="h-analysis">
+        <div class="card-head">
+          <h2 class="h5" id="h-analysis">Analysis</h2>
+          <span class="caption muted">Sections from the case template. Claude can draft these; edit anything.</span>
+        </div>
+        <div id="analysis-sections" class="section-list"></div>
+      </section>
+
       <section class="card" aria-labelledby="h-take">
         <div class="card-head">
           <h2 class="h5" id="h-take">Your take</h2>
-          <span class="caption muted">Optional now. You can fill these at review.</span>
+          <span class="caption muted">Yours alone. Claude leaves these to you.</span>
         </div>
         <div class="fields">
           <div class="field">
@@ -127,14 +150,7 @@
             <span class="label muted" id="l-rating">Rating</span>
             <div class="seg tabular" id="rating" role="group" aria-labelledby="l-rating"></div>
           </div>
-          <label class="field full">
-            <span class="label muted">Context</span>
-            <textarea id="context" class="input" rows="2" placeholder="What task does this screen support, and for whom? 1–2 sentences."></textarea>
-          </label>
-          <label class="field full">
-            <span class="label muted">What I like</span>
-            <textarea id="like" class="input" rows="3" placeholder="Name the exact decision, e.g. Status is a 12px tonal chip in its own column, so rows stay neutral and the eye scans one column for problems."></textarea>
-          </label>
+          <div id="my-sections" class="section-list full"></div>
         </div>
       </section>
 
@@ -157,16 +173,12 @@
             <span class="body2"><a id="link-folder" href="#" target="_blank" rel="noopener noreferrer">Open folder</a> · <a id="link-commit" href="#" target="_blank" rel="noopener noreferrer">View commit</a></span>
           </li>
           <li>
-            <span class="label">2. Pull it into your local copy</span>
+            <span class="label">2. Review it when you're ready</span>
+            <span class="body2 muted">Check Claude's analysis, write “What I like” if you haven't, then set <code>status: reviewed</code>.</span>
+          </li>
+          <li>
+            <span class="label">3. Pull it into your local copy</span>
             <div class="copyline"><code id="cmd-pull">git pull</code><button class="iconbtn" data-copy="cmd-pull" aria-label="Copy command" title="Copy"><span class="icon sm">content_copy</span></button></div>
-          </li>
-          <li>
-            <span class="label">3. Ask Claude to draft the analysis</span>
-            <div class="copyline"><code id="cmd-draft"></code><button class="iconbtn" data-copy="cmd-draft" aria-label="Copy prompt" title="Copy"><span class="icon sm">content_copy</span></button></div>
-          </li>
-          <li>
-            <span class="label">4. Review it yourself</span>
-            <span class="body2 muted">Rewrite “What I like” in your own words, fix tags, set <code>rating</code> and <code>status: reviewed</code>.</span>
           </li>
         </ol>
       </section>

@@ -1,7 +1,8 @@
 import { LibraryRepo } from './github.js';
+import { analyzeScreenshots } from './claude.js';
 import { prepareImage, formatBytes, MAX_IMAGE_BYTES } from './images.js';
 import {
-  parseTaxonomy, tagGroups, parseCaseMeta, buildCaseMd, nextCaseNumber, caseId, slugify,
+  parseTaxonomy, tagGroups, templateSections, parseCaseMeta, buildCaseMd, nextCaseNumber, caseId, slugify,
 } from './library.js';
 
 const CASES_DIR = 'cases/visual';
@@ -9,6 +10,13 @@ const FIT_OPTIONS = [
   ['aligned', 'Matches DESIGN.md'],
   ['extends', 'Adds something compatible with DESIGN.md'],
   ['conflicts', 'Goes against DESIGN.md — explain in “What I would change”'],
+];
+// Sections that hold my judgment: shown under "Your take", never drafted by Claude.
+const MY_SECTIONS = ['What I like'];
+// Sections the analysis prompt adds after the template's own.
+const EXTRA_SECTIONS = [
+  { heading: 'Open questions', hint: 'What a static screenshot can’t answer, such as interactions.' },
+  { heading: 'Suggested new tags', hint: 'Tags that would fit but aren’t in taxonomy.yml yet.' },
 ];
 const STATUS_CHIP = { draft: 't-neutral', reviewed: 't-success', synthesized: 't-info' };
 
@@ -19,21 +27,24 @@ const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /* ---------- State ---------- */
 
-const emptyDraft = () => ({ images: [], tags: {}, fit: 'aligned', rating: 0, slugEdited: false });
+const emptyDraft = () => ({ images: [], tags: {}, sections: {}, fit: 'aligned', rating: 0, slugEdited: false });
 
 const state = {
   repo: null,        // LibraryRepo once connected
   template: '',      // templates/visual-case.md
+  taxonomy: '',      // taxonomy.yml as text
   groups: [],        // tag groups from template + taxonomy
+  sections: [],      // body sections from the template + EXTRA_SECTIONS
   cases: [],         // [{ folder, id, title, status }]
   nextNumber: 1,
   draft: emptyDraft(),
   saving: false,
+  analyzing: false,
 };
 
-/* ---------- Credentials, kept per browser ---------- */
+/* ---------- Secrets, kept per browser ---------- */
 
-const KEYS = { repo: 'collect.repo', token: 'collect.token' };
+const KEYS = { repo: 'collect.repo', token: 'collect.token', anthropic: 'collect.anthropic-key' };
 const session = {
   load() {
     try {
@@ -41,21 +52,25 @@ const session = {
       return {
         repo: localStorage.getItem(KEYS.repo) || '',
         token: sessionToken || localStorage.getItem(KEYS.token) || '',
+        anthropicKey: sessionStorage.getItem(KEYS.anthropic) || localStorage.getItem(KEYS.anthropic) || '',
         remember: !sessionToken,
       };
     } catch {
-      return { repo: '', token: '', remember: true };
+      return { repo: '', token: '', anthropicKey: '', remember: true };
     }
   },
-  save(repo, token, remember) {
+  // Secrets follow the "Remember on this device" choice made when connecting.
+  saveSecret(key, value, remember = this.load().remember) {
     try {
-      localStorage.setItem(KEYS.repo, repo);
-      (remember ? localStorage : sessionStorage).setItem(KEYS.token, token);
-      (remember ? sessionStorage : localStorage).removeItem(KEYS.token);
+      (remember ? localStorage : sessionStorage).setItem(key, value);
+      (remember ? sessionStorage : localStorage).removeItem(key);
     } catch { /* storage blocked: works until the tab closes */ }
   },
-  forget() {
-    try { localStorage.removeItem(KEYS.token); sessionStorage.removeItem(KEYS.token); } catch { /* nothing stored */ }
+  saveRepo(repo) {
+    try { localStorage.setItem(KEYS.repo, repo); } catch { /* not remembered */ }
+  },
+  forget(...keys) {
+    try { keys.forEach((k) => { localStorage.removeItem(k); sessionStorage.removeItem(k); }); } catch { /* nothing stored */ }
   },
 };
 
@@ -69,7 +84,12 @@ async function loadLibrary(repo) {
     if (e.status === 404) throw new Error(`${repo.fullName} is missing taxonomy.yml or templates/visual-case.md. Is it the library repo?`);
     throw e;
   }
-  return { template, groups: tagGroups(template, parseTaxonomy(taxonomy)) };
+  return {
+    template,
+    taxonomy,
+    groups: tagGroups(template, parseTaxonomy(taxonomy)),
+    sections: [...templateSections(template), ...EXTRA_SECTIONS],
+  };
 }
 
 async function loadCases(repo) {
@@ -97,8 +117,8 @@ function dropUnknownTags() {
 
 function describeError(e) {
   if (e instanceof TypeError) return 'Could not reach GitHub. Check your connection.';
-  if (e.status === 401) return 'The token is invalid or has expired. Paste a new one.';
-  if (e.status === 403) return 'The token is not allowed to do this. It needs Contents: Read and write on the library repo.';
+  if (e.status === 401) return 'The GitHub token is invalid or has expired. Paste a new one.';
+  if (e.status === 403) return 'The GitHub token is not allowed to do this. It needs Contents: Read and write on the library repo.';
   if (e.status === 404) return 'Repository not found, or the token has no access to it.';
   return e.message;
 }
@@ -119,8 +139,7 @@ function draftCase() {
     tags: draft.tags,
     fit: draft.fit,
     rating: draft.rating,
-    context: $('#context').value,
-    like: $('#like').value,
+    sections: draft.sections,
     images: draft.images.map(shotName),
   };
 }
@@ -141,7 +160,7 @@ const isDirty = () => state.draft.images.length > 0 || $('#title').value.trim() 
 function resetDraft() {
   state.draft.images.forEach((img) => URL.revokeObjectURL(img.url));
   state.draft = emptyDraft();
-  for (const id of ['title', 'product', 'url', 'slug', 'context', 'like']) $(`#${id}`).value = '';
+  for (const id of ['title', 'product', 'url', 'slug']) $(`#${id}`).value = '';
   $('#captured').value = today();
 }
 
@@ -154,7 +173,58 @@ async function addImages(files) {
     state.draft.images.push({ ...prepared, url: URL.createObjectURL(prepared.blob), original: file.name || 'Pasted image' });
   }
   renderShots();
+  renderAnalyze();
   renderStatus();
+}
+
+// Claude's draft fills only what is still empty, so nothing you typed is overwritten.
+function applyAnalysis(result) {
+  const { draft } = state;
+  const fillInput = (id, value) => { if (!$(id).value.trim() && value) $(id).value = value; };
+  fillInput('#title', result.title);
+  fillInput('#product', result.product);
+  if (!draft.slugEdited) $('#slug').value = slugify($('#title').value);
+  for (const [key, values] of Object.entries(result.tags)) {
+    if (!draft.tags[key]?.length) draft.tags[key] = values;
+  }
+  draft.fit = result.fit;
+  for (const [heading, text] of Object.entries(result.sections)) {
+    if (!draft.sections[heading]?.trim() && text.trim()) draft.sections[heading] = text.trim();
+  }
+}
+
+async function analyze() {
+  if (state.analyzing || !state.repo || !state.draft.images.length) return;
+  const { anthropicKey } = session.load();
+  if (!anthropicKey) {
+    $('#claude-key').hidden = false;
+    $('#anthropic-key').focus();
+    return;
+  }
+  state.analyzing = true;
+  renderAnalyze();
+  try {
+    const [prompt, design] = await Promise.all([
+      state.repo.readText('prompts/analyze-visual-case.md'),
+      state.repo.readText('DESIGN.md'),
+    ]);
+    const result = await analyzeScreenshots({
+      apiKey: anthropicKey,
+      images: state.draft.images.map((img) => img.blob),
+      guide: { prompt, design, taxonomy: state.taxonomy },
+      groups: state.groups,
+      sections: state.sections.filter((s) => !MY_SECTIONS.includes(s.heading)),
+      fitOptions: FIT_OPTIONS.map(([v]) => v),
+    });
+    applyAnalysis(result);
+    banner();
+    toast('Draft ready. Review it before saving.');
+  } catch (e) {
+    banner('error', `Analysis failed. ${esc(e.status ? describeError(e) : e.message)}`);
+  } finally {
+    state.analyzing = false;
+    renderAll();
+  }
 }
 
 async function save() {
@@ -190,7 +260,9 @@ async function save() {
 function renderAll() {
   renderConnection();
   renderShots();
+  renderAnalyze();
   renderTags();
+  renderSections();
   renderChoices();
   renderCases();
   renderStatus();
@@ -230,6 +302,21 @@ function renderShots() {
   }).join('');
 }
 
+function renderAnalyze() {
+  const hasKey = !!session.load().anthropicKey;
+  const ready = !!state.repo && state.draft.images.length > 0;
+  const button = $('#analyze-btn');
+  button.disabled = state.analyzing || !ready;
+  button.innerHTML = state.analyzing
+    ? '<span class="icon">hourglass_top</span>Analyzing…'
+    : '<span class="icon">auto_awesome</span>Analyze with Claude';
+  $('#analyze-hint').textContent = state.analyzing
+    ? 'Usually takes under a minute.'
+    : ready ? 'Drafts the title, tags and analysis. You review before saving.' : 'Add a screenshot to analyze it.';
+  $('#forget-key').hidden = !hasKey;
+  if (hasKey) $('#claude-key').hidden = true;
+}
+
 function renderTags() {
   if (!state.groups.length) {
     $('#tags').innerHTML = '<p class="body2 faint">Connect to GitHub to load tags.</p>';
@@ -249,6 +336,18 @@ function renderTags() {
       </div>
     </div>`;
   }).join('');
+}
+
+function renderSections() {
+  const field = (s) => `<label class="field">
+      <span class="label muted">${esc(s.heading)}</span>
+      <textarea class="input" rows="3" data-section="${esc(s.heading)}" placeholder="${esc(s.hint)}">${esc(state.draft.sections[s.heading] || '')}</textarea>
+    </label>`;
+  const empty = '<p class="body2 faint">Connect to GitHub to load the case template.</p>';
+  const mine = state.sections.filter((s) => MY_SECTIONS.includes(s.heading));
+  const drafted = state.sections.filter((s) => !MY_SECTIONS.includes(s.heading));
+  $('#my-sections').innerHTML = state.sections.length ? mine.map(field).join('') : empty;
+  $('#analysis-sections').innerHTML = state.sections.length ? drafted.map(field).join('') : empty;
 }
 
 function renderChoices() {
@@ -291,7 +390,6 @@ function showSaved(id, folder, commitUrl) {
   $('#next-id').textContent = id;
   $('#link-folder').href = state.repo.webUrl(folder);
   $('#link-commit').href = commitUrl;
-  $('#cmd-draft').textContent = `Fill ${folder}/case.md using prompts/analyze-visual-case.md. The screenshots are in the same folder.`;
   $('#next').hidden = false;
 }
 
@@ -315,7 +413,8 @@ async function onConnect() {
   $('#connect-btn').disabled = true;
   try {
     await connect(name, token);
-    session.save(state.repo.fullName, token, remember);
+    session.saveRepo(state.repo.fullName);
+    session.saveSecret(KEYS.token, token, remember);
     $('#token').value = '';
     banner(state.repo.isPrivate ? undefined : 'warning', `${esc(state.repo.fullName)} is public. Cases and screenshots will be visible to anyone.`);
     renderAll();
@@ -327,11 +426,26 @@ async function onConnect() {
 }
 
 function onSignOut() {
-  session.forget();
-  Object.assign(state, { repo: null, template: '', groups: [], cases: [], nextNumber: 1 });
+  session.forget(KEYS.token, KEYS.anthropic);
+  Object.assign(state, { repo: null, template: '', taxonomy: '', groups: [], sections: [], cases: [], nextNumber: 1 });
   $('#next').hidden = true;
   banner();
   renderAll();
+}
+
+function onSaveKey() {
+  const key = $('#anthropic-key').value.trim();
+  if (!key) return $('#anthropic-key').focus();
+  session.saveSecret(KEYS.anthropic, key);
+  $('#anthropic-key').value = '';
+  renderAnalyze();
+  analyze();
+}
+
+function onForgetKey() {
+  session.forget(KEYS.anthropic);
+  renderAnalyze();
+  toast('Anthropic API key removed from this browser');
 }
 
 async function onReloadTags() {
@@ -340,7 +454,8 @@ async function onReloadTags() {
     Object.assign(state, await loadLibrary(state.repo));
     dropUnknownTags();
     renderTags();
-    toast('Tags reloaded from taxonomy.yml');
+    renderSections();
+    toast('Reloaded taxonomy.yml and the case template');
   } catch (e) {
     banner('error', esc(describeError(e)));
   }
@@ -370,6 +485,7 @@ function onShotClick(e) {
     [images[i - 1], images[i]] = [images[i], images[i - 1]];
   } else return;
   renderShots();
+  renderAnalyze();
   renderStatus();
 }
 
@@ -378,6 +494,11 @@ function bindEvents() {
   $('#token').addEventListener('keydown', (e) => e.key === 'Enter' && onConnect());
   $('#repo').addEventListener('click', (e) => e.target.closest('#sign-out') && onSignOut());
   $('#reload-tax').addEventListener('click', onReloadTags);
+
+  $('#analyze-btn').addEventListener('click', analyze);
+  $('#save-key').addEventListener('click', onSaveKey);
+  $('#anthropic-key').addEventListener('keydown', (e) => e.key === 'Enter' && onSaveKey());
+  $('#forget-key').addEventListener('click', onForgetKey);
 
   const drop = $('#drop');
   drop.addEventListener('click', () => $('#file').click());
@@ -420,7 +541,11 @@ function bindEvents() {
   });
   $('#slug').addEventListener('input', () => { state.draft.slugEdited = $('#slug').value.trim() !== ''; });
   $('#slug').addEventListener('blur', () => { $('#slug').value = slugify($('#slug').value); });
-  $('#case-form').addEventListener('input', renderStatus);
+  $('#case-form').addEventListener('input', (e) => {
+    const heading = e.target.dataset?.section;
+    if (heading) state.draft.sections[heading] = e.target.value;
+    renderStatus();
+  });
 
   $('#save').addEventListener('click', save);
   document.addEventListener('keydown', (e) => {
