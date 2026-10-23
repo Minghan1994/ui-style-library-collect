@@ -69,6 +69,10 @@ No build step and no dependencies.
 | `js/github.js` | All GitHub API calls |
 | `js/images.js` | Image size limit and WebP conversion |
 
+**Releasing:** bump `?v=` on the `app.js` script tag in `index.html`.
+`app.js` loads the other modules with the same version, so browsers never
+mix cached and fresh files after a deploy.
+
 Run the tests (Node 20+):
 
 ```bash

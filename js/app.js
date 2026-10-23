@@ -1,8 +1,23 @@
-import { LibraryRepo } from './github.js';
-import { prepareImage, formatBytes, MAX_IMAGE_BYTES } from './images.js';
-import {
+// Shown in place of the "Loading…" note when the page can't start.
+function showStartupError(error) {
+  const boot = document.getElementById('boot');
+  boot.className = 'alert t-error';
+  boot.textContent = `The page couldn’t start (${error?.message || error}). Reload it; if that doesn’t help, open it in a private window.`;
+}
+
+// index.html loads this file as app.js?v=N. The other modules are loaded
+// with the same ?v= so a deploy never mixes cached and fresh files.
+const version = new URL(import.meta.url).search;
+let modules;
+try {
+  modules = await Promise.all(['github', 'images', 'library'].map((name) => import(`./${name}.js${version}`)));
+} catch (e) {
+  showStartupError(e);
+  throw e;
+}
+const [{ LibraryRepo }, { prepareImage, formatBytes, MAX_IMAGE_BYTES }, {
   parseTaxonomy, tagGroups, templateSections, parseCase, writeCase, needsAnalysis, nextCaseNumber, caseId,
-} from './library.js';
+}] = modules;
 
 const CASES_DIR = 'cases/visual';
 const FIT_OPTIONS = [
@@ -540,6 +555,7 @@ async function start() {
   }
   renderCapture();
   await onRoute();
+  $('#boot').hidden = true;
 }
 
-start();
+start().catch(showStartupError);
