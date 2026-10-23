@@ -34,8 +34,16 @@ export class LibraryRepo {
   }
 
   readText(path) {
+    return this.#request(this.#contentsPath(path), { as: 'text' });
+  }
+
+  readBlob(path) {
+    return this.#request(this.#contentsPath(path), { as: 'blob' });
+  }
+
+  #contentsPath(path) {
     const encoded = path.split('/').map(encodeURIComponent).join('/');
-    return this.#request(`/repos/${this.fullName}/contents/${encoded}?ref=${encodeURIComponent(this.branch)}`, { raw: true });
+    return `/repos/${this.fullName}/contents/${encoded}?ref=${encodeURIComponent(this.branch)}`;
   }
 
   /** Every folder in `dir` with the text of its case.md, in one GraphQL call. */
@@ -89,13 +97,14 @@ export class LibraryRepo {
     throw new GitHubError(409, 'The branch kept changing while saving. Try again.');
   }
 
-  async #request(path, { method = 'GET', body, raw = false } = {}) {
+  // as: 'json' (default), or 'text' / 'blob' for a file's raw contents.
+  async #request(path, { method = 'GET', body, as = 'json' } = {}) {
     const res = await fetch(API + path, {
       method,
       cache: 'no-store',
       headers: {
         Authorization: `Bearer ${this.#token}`,
-        Accept: raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
+        Accept: as === 'json' ? 'application/vnd.github+json' : 'application/vnd.github.raw+json',
         'X-GitHub-Api-Version': '2022-11-28',
         ...(body && { 'Content-Type': 'application/json' }),
       },
@@ -105,7 +114,7 @@ export class LibraryRepo {
       const data = await res.json().catch(() => ({}));
       throw new GitHubError(res.status, data.message || res.statusText);
     }
-    return raw ? res.text() : res.json();
+    return res[as]();
   }
 }
 

@@ -1,15 +1,14 @@
 import { LibraryRepo } from './github.js';
-import { analyzeScreenshots } from './claude.js';
 import { prepareImage, formatBytes, MAX_IMAGE_BYTES } from './images.js';
 import {
-  parseTaxonomy, tagGroups, templateSections, parseCaseMeta, buildCaseMd, nextCaseNumber, caseId, slugify,
+  parseTaxonomy, tagGroups, templateSections, parseCase, writeCase, needsAnalysis, nextCaseNumber, caseId,
 } from './library.js';
 
 const CASES_DIR = 'cases/visual';
 const FIT_OPTIONS = [
   ['aligned', 'Matches DESIGN.md'],
   ['extends', 'Adds something compatible with DESIGN.md'],
-  ['conflicts', 'Goes against DESIGN.md — explain in “What I would change”'],
+  ['conflicts', 'Goes against DESIGN.md'],
 ];
 // Sections that hold my judgment: shown under "Your take", never drafted by Claude.
 const MY_SECTIONS = ['What I like'];
@@ -18,7 +17,7 @@ const EXTRA_SECTIONS = [
   { heading: 'Open questions', hint: 'What a static screenshot can’t answer, such as interactions.' },
   { heading: 'Suggested new tags', hint: 'Tags that would fit but aren’t in taxonomy.yml yet.' },
 ];
-const STATUS_CHIP = { draft: 't-neutral', reviewed: 't-success', synthesized: 't-info' };
+const POLL_MS = 20000;
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -27,24 +26,25 @@ const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 /* ---------- State ---------- */
 
-const emptyDraft = () => ({ images: [], tags: {}, sections: {}, fit: 'aligned', rating: 0, slugEdited: false });
-
 const state = {
-  repo: null,        // LibraryRepo once connected
-  template: '',      // templates/visual-case.md
-  taxonomy: '',      // taxonomy.yml as text
-  groups: [],        // tag groups from template + taxonomy
-  sections: [],      // body sections from the template + EXTRA_SECTIONS
-  cases: [],         // [{ folder, id, title, status }]
+  repo: null,          // LibraryRepo once connected
+  template: '',        // templates/visual-case.md
+  groups: [],          // tag groups from template + taxonomy
+  sections: [],        // body sections: template's + EXTRA_SECTIONS
+  cases: [],           // [{ folder, id, title, status, analyzing }]
   nextNumber: 1,
-  draft: emptyDraft(),
+  capture: [],         // images for the next case: [{ blob, ext, note, url, original }]
   saving: false,
-  analyzing: false,
+  review: null,        // { id, folder, md, data, images, dirty }
 };
 
-/* ---------- Secrets, kept per browser ---------- */
+const headings = () => state.sections.map((s) => s.heading);
+const analysisHeadings = () => headings().filter((h) => !MY_SECTIONS.includes(h));
+const caseById = (id) => state.cases.find((c) => c.id === id);
 
-const KEYS = { repo: 'collect.repo', token: 'collect.token', anthropic: 'collect.anthropic-key' };
+/* ---------- Credentials, kept per browser ---------- */
+
+const KEYS = { repo: 'collect.repo', token: 'collect.token' };
 const session = {
   load() {
     try {
@@ -52,25 +52,21 @@ const session = {
       return {
         repo: localStorage.getItem(KEYS.repo) || '',
         token: sessionToken || localStorage.getItem(KEYS.token) || '',
-        anthropicKey: sessionStorage.getItem(KEYS.anthropic) || localStorage.getItem(KEYS.anthropic) || '',
         remember: !sessionToken,
       };
     } catch {
-      return { repo: '', token: '', anthropicKey: '', remember: true };
+      return { repo: '', token: '', remember: true };
     }
   },
-  // Secrets follow the "Remember on this device" choice made when connecting.
-  saveSecret(key, value, remember = this.load().remember) {
+  save(repo, token, remember) {
     try {
-      (remember ? localStorage : sessionStorage).setItem(key, value);
-      (remember ? sessionStorage : localStorage).removeItem(key);
+      localStorage.setItem(KEYS.repo, repo);
+      (remember ? localStorage : sessionStorage).setItem(KEYS.token, token);
+      (remember ? sessionStorage : localStorage).removeItem(KEYS.token);
     } catch { /* storage blocked: works until the tab closes */ }
   },
-  saveRepo(repo) {
-    try { localStorage.setItem(KEYS.repo, repo); } catch { /* not remembered */ }
-  },
-  forget(...keys) {
-    try { keys.forEach((k) => { localStorage.removeItem(k); sessionStorage.removeItem(k); }); } catch { /* nothing stored */ }
+  forget() {
+    try { localStorage.removeItem(KEYS.token); sessionStorage.removeItem(KEYS.token); } catch { /* nothing stored */ }
   },
 };
 
@@ -86,32 +82,45 @@ async function loadLibrary(repo) {
   }
   return {
     template,
-    taxonomy,
     groups: tagGroups(template, parseTaxonomy(taxonomy)),
     sections: [...templateSections(template), ...EXTRA_SECTIONS],
   };
 }
 
-async function loadCases(repo) {
+async function loadCases(repo, analysis) {
   const folders = (await repo.listFolders(CASES_DIR)).filter((f) => /^v-\d{4,}/.test(f.name));
   const cases = folders
-    .map((f) => ({ folder: f.name, id: f.name.match(/^v-\d+/)[0], ...parseCaseMeta(f.caseMd) }))
+    .map((f) => {
+      const c = parseCase(f.caseMd);
+      return { folder: f.name, id: f.name.match(/^v-\d+/)[0], title: c.title, status: c.status, analyzing: needsAnalysis(f.caseMd, analysis) };
+    })
     .sort((a, b) => b.folder.localeCompare(a.folder));
   return { cases, nextNumber: nextCaseNumber(folders.map((f) => f.name)) };
 }
 
 async function connect(repoName, token) {
   const repo = await LibraryRepo.open(repoName, token);
-  const [library, cases] = await Promise.all([loadLibrary(repo), loadCases(repo)]);
-  Object.assign(state, { repo }, library, cases);
-  dropUnknownTags();
+  Object.assign(state, { repo }, await loadLibrary(repo));
+  await refreshCases();
 }
 
-function dropUnknownTags() {
-  const { tags } = state.draft;
-  for (const key of Object.keys(tags)) {
-    const group = state.groups.find((g) => g.key === key);
-    tags[key] = group ? tags[key].filter((t) => group.values.some((v) => v.value === t)) : [];
+// Re-reads the case list; keeps checking while any case is being analyzed.
+let pollTimer;
+async function refreshCases() {
+  clearTimeout(pollTimer);
+  Object.assign(state, await loadCases(state.repo, analysisHeadings()));
+  renderCases();
+  if (state.cases.some((c) => c.analyzing)) pollTimer = setTimeout(poll, POLL_MS);
+}
+
+async function poll() {
+  if (!state.repo) return;
+  const waiting = state.review?.data && caseById(state.review.id)?.analyzing;
+  try {
+    await refreshCases();
+    if (waiting && !caseById(state.review.id)?.analyzing) await openReview(state.review.id);
+  } catch {
+    pollTimer = setTimeout(poll, POLL_MS); // offline for a moment; try again later
   }
 }
 
@@ -119,174 +128,138 @@ function describeError(e) {
   if (e instanceof TypeError) return 'Could not reach GitHub. Check your connection.';
   if (e.status === 401) return 'The GitHub token is invalid or has expired. Paste a new one.';
   if (e.status === 403) return 'The GitHub token is not allowed to do this. It needs Contents: Read and write on the library repo.';
-  if (e.status === 404) return 'Repository not found, or the token has no access to it.';
+  if (e.status === 404) return 'Not found, or the token has no access to it.';
   return e.message;
 }
 
-/* ---------- The case being drafted ---------- */
+/* ---------- New case ---------- */
 
 const shotName = (img, i) => `shot-${String(i + 1).padStart(2, '0')}.${img.ext}`;
 
-function draftCase() {
-  const { draft } = state;
-  return {
-    id: caseId(state.nextNumber),
-    title: $('#title').value.trim(),
-    product: $('#product').value.trim(),
-    url: $('#url').value.trim(),
-    captured: $('#captured').value || today(),
-    slug: slugify($('#slug').value || $('#title').value),
-    tags: draft.tags,
-    fit: draft.fit,
-    rating: draft.rating,
-    sections: draft.sections,
-    images: draft.images.map(shotName),
-  };
-}
-
-function missing(c) {
-  return [
-    !state.repo && 'connect to GitHub',
-    !state.draft.images.length && 'add a screenshot',
-    !c.title && 'add a title',
-    !c.product && 'add the product',
-    !c.slug && 'add a folder name',
-    state.draft.images.some((i) => i.blob.size > MAX_IMAGE_BYTES) && 'shrink images over 1 MB',
-  ].filter(Boolean);
-}
-
-const isDirty = () => state.draft.images.length > 0 || $('#title').value.trim() !== '';
-
-function resetDraft() {
-  state.draft.images.forEach((img) => URL.revokeObjectURL(img.url));
-  state.draft = emptyDraft();
-  for (const id of ['title', 'product', 'url', 'slug']) $(`#${id}`).value = '';
-  $('#captured').value = today();
-}
-
 async function addImages(files) {
   const images = [...files].filter((f) => f.type.startsWith('image/'));
-  if (!images.length) return;
-  setStatus('Processing images…');
   for (const file of images) {
     const prepared = await prepareImage(file);
-    state.draft.images.push({ ...prepared, url: URL.createObjectURL(prepared.blob), original: file.name || 'Pasted image' });
+    state.capture.push({ ...prepared, url: URL.createObjectURL(prepared.blob), original: file.name || 'Pasted image' });
   }
-  renderShots();
-  renderAnalyze();
-  renderStatus();
+  renderCapture();
 }
 
-// Claude's draft fills only what is still empty, so nothing you typed is overwritten.
-function applyAnalysis(result) {
-  const { draft } = state;
-  const fillInput = (id, value) => { if (!$(id).value.trim() && value) $(id).value = value; };
-  fillInput('#title', result.title);
-  fillInput('#product', result.product);
-  if (!draft.slugEdited) $('#slug').value = slugify($('#title').value);
-  for (const [key, values] of Object.entries(result.tags)) {
-    if (!draft.tags[key]?.length) draft.tags[key] = values;
-  }
-  draft.fit = result.fit;
-  for (const [heading, text] of Object.entries(result.sections)) {
-    if (!draft.sections[heading]?.trim() && text.trim()) draft.sections[heading] = text.trim();
-  }
-}
-
-async function analyze() {
-  if (state.analyzing || !state.repo || !state.draft.images.length) return;
-  const { anthropicKey } = session.load();
-  if (!anthropicKey) {
-    $('#claude-key').hidden = false;
-    $('#anthropic-key').focus();
-    return;
-  }
-  state.analyzing = true;
-  renderAnalyze();
-  try {
-    const [prompt, design] = await Promise.all([
-      state.repo.readText('prompts/analyze-visual-case.md'),
-      state.repo.readText('DESIGN.md'),
-    ]);
-    const result = await analyzeScreenshots({
-      apiKey: anthropicKey,
-      images: state.draft.images.map((img) => img.blob),
-      guide: { prompt, design, taxonomy: state.taxonomy },
-      groups: state.groups,
-      sections: state.sections.filter((s) => !MY_SECTIONS.includes(s.heading)),
-      fitOptions: FIT_OPTIONS.map(([v]) => v),
-    });
-    applyAnalysis(result);
-    banner();
-    toast('Draft ready. Review it before saving.');
-  } catch (e) {
-    banner('error', `Analysis failed. ${esc(e.status ? describeError(e) : e.message)}`);
-  } finally {
-    state.analyzing = false;
-    renderAll();
-  }
-}
-
-async function save() {
-  if (state.saving || missing(draftCase()).length) return;
+async function saveCapture() {
+  const images = state.capture;
+  if (state.saving || !images.length || images.some((i) => i.blob.size > MAX_IMAGE_BYTES)) return;
   state.saving = true;
-  renderStatus();
+  renderCapture();
   try {
-    setStatus('Checking the repo…');
-    Object.assign(state, await loadCases(state.repo)); // another device may have saved a case
-    const c = draftCase();
-    const folder = `${CASES_DIR}/${c.id}-${c.slug}`;
-    const files = [
-      ...state.draft.images.map((img, i) => ({ path: `${folder}/${c.images[i]}`, content: img.blob })),
-      { path: `${folder}/case.md`, content: buildCaseMd(state.template, state.groups, c) },
-    ];
-    const commit = await state.repo.commit(files, `case: ${c.id} ${c.title.toLowerCase()}`, setStatus);
-    showSaved(c.id, folder, commit.url);
-    Object.assign(state, await loadCases(state.repo));
-    resetDraft();
+    await refreshCases(); // another device may have saved a case
+    const id = caseId(state.nextNumber);
+    const folder = `${CASES_DIR}/${id}`; // Claude adds a short name after analyzing
+    const names = images.map(shotName);
+    const md = writeCase(state.template, state.groups, { id, url: $('#url').value.trim(), captured: today(), images: names });
+    await state.repo.commit([
+      ...images.map((img, i) => ({ path: `${folder}/${names[i]}`, content: img.blob })),
+      { path: `${folder}/case.md`, content: md },
+    ], `case: ${id} capture`);
+    images.forEach((img) => URL.revokeObjectURL(img.url));
+    state.capture = [];
+    $('#url').value = '';
     banner();
-    toast(`Committed ${folder}`);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    toast(`Saved ${id}. Claude is analyzing it; this takes a few minutes.`);
+    await refreshCases();
   } catch (e) {
     banner('error', `Not saved. ${esc(describeError(e))}`);
   } finally {
     state.saving = false;
-    renderAll();
+    renderCapture();
+  }
+}
+
+/* ---------- Review ---------- */
+
+async function openReview(id) {
+  const entry = caseById(id);
+  if (!entry) {
+    banner('error', `${esc(id)} doesn’t exist.`);
+    location.hash = '#/';
+    return;
+  }
+  const dir = `${CASES_DIR}/${entry.folder}`;
+  state.review = { id, folder: entry.folder, md: '', data: null, images: [], dirty: false };
+  renderReview();
+  try {
+    const md = await state.repo.readText(`${dir}/case.md`);
+    const data = parseCase(md, headings());
+    const blobs = await Promise.all(data.images.map((name) => state.repo.readBlob(`${dir}/${name}`).catch(() => null)));
+    if (state.review?.id !== id) return; // navigated away meanwhile
+    state.review.images.forEach((img) => URL.revokeObjectURL(img.url));
+    Object.assign(state.review, {
+      md, data, images: data.images.map((name, i) => ({ name, url: blobs[i] && URL.createObjectURL(blobs[i]) })),
+    });
+  } catch (e) {
+    banner('error', esc(describeError(e)));
+  }
+  renderReview();
+}
+
+function closeReview() {
+  state.review?.images.forEach((img) => img.url && URL.revokeObjectURL(img.url));
+  state.review = null;
+}
+
+async function saveReview(markReviewed) {
+  const r = state.review;
+  if (state.saving || !r?.data) return;
+  state.saving = true;
+  renderReviewActions();
+  try {
+    const { title, product, url, captured, tags, fit, rating, status, sections } = r.data;
+    const next = markReviewed ? 'reviewed' : status;
+    const md = writeCase(r.md, state.groups, { title, product, url, captured, tags, fit, rating, status: next, sections });
+    await state.repo.commit([{ path: `${CASES_DIR}/${r.folder}/case.md`, content: md }], `case: ${r.id} ${markReviewed ? 'reviewed' : 'edits'}`);
+    Object.assign(r, { md, dirty: false });
+    r.data.status = next;
+    banner();
+    toast(markReviewed ? `${r.id} marked as reviewed` : `Saved ${r.id}`);
+    await refreshCases();
+    if (markReviewed) location.hash = '#/';
+  } catch (e) {
+    banner('error', `Not saved. ${esc(describeError(e))}`);
+  } finally {
+    state.saving = false;
+    renderReviewActions();
   }
 }
 
 /* ---------- Rendering ---------- */
 
-function renderAll() {
-  renderConnection();
-  renderShots();
-  renderAnalyze();
-  renderTags();
-  renderSections();
-  renderChoices();
-  renderCases();
-  renderStatus();
-}
-
 function banner(kind, html) {
-  const icon = { error: 'error', warning: 'warning' }[kind];
+  const icon = { error: 'error', warning: 'warning', info: 'info' }[kind];
   $('#banner').innerHTML = kind
     ? `<div class="alert t-${kind}" role="${kind === 'error' ? 'alert' : 'status'}"><span class="icon">${icon}</span><div>${html}</div></div>`
     : '';
 }
 
-function renderConnection() {
-  const { repo } = state;
-  $('#connect').hidden = !!repo;
-  $('#repo').innerHTML = repo
-    ? `<a class="chip t-success" href="${esc(repo.webUrl())}" target="_blank" rel="noopener noreferrer" title="Open on GitHub">
-         <span class="icon">${repo.isPrivate ? 'lock' : 'public'}</span>${esc(repo.fullName)}</a>
+function renderView() {
+  const connected = !!state.repo;
+  $('#connect').hidden = connected;
+  $('#home').hidden = !connected || !!state.review;
+  $('#review').hidden = !connected || !state.review;
+  $('#repo').innerHTML = connected
+    ? `<a class="chip t-success" href="${esc(state.repo.webUrl())}" target="_blank" rel="noopener noreferrer" title="Open on GitHub">
+         <span class="icon">${state.repo.isPrivate ? 'lock' : 'public'}</span>${esc(state.repo.fullName)}</a>
        <button class="btn btn-text" id="sign-out">Sign out</button>`
     : '';
 }
 
-function renderShots() {
-  $('#shots').innerHTML = state.draft.images.map((img, i) => {
+function statusChip(c) {
+  if (c.analyzing) return '<span class="chip t-neutral"><span class="icon spin">progress_activity</span>Analyzing</span>';
+  if (c.status === 'draft') return '<span class="chip t-info">To review</span>';
+  if (c.status === 'reviewed') return '<span class="chip t-success">Reviewed</span>';
+  return `<span class="chip t-neutral">${esc(capitalize(c.status || 'unknown'))}</span>`;
+}
+
+function renderCapture() {
+  $('#shots').innerHTML = state.capture.map((img, i) => {
     const tooBig = img.blob.size > MAX_IMAGE_BYTES;
     const note = tooBig ? 'Still over 1 MB. Crop it before saving.' : img.note;
     return `<figure class="shot">
@@ -300,30 +273,67 @@ function renderShots() {
       ${note ? `<figcaption class="note caption ${tooBig ? 'warn-text' : 'muted'}">${esc(note)}</figcaption>` : ''}
     </figure>`;
   }).join('');
+  const save = $('#save-capture');
+  save.disabled = state.saving || !state.capture.length || state.capture.some((i) => i.blob.size > MAX_IMAGE_BYTES);
+  save.innerHTML = state.saving ? '<span class="icon spin">progress_activity</span>Saving…' : '<span class="icon">cloud_upload</span>Save';
 }
 
-function renderAnalyze() {
-  const hasKey = !!session.load().anthropicKey;
-  const ready = !!state.repo && state.draft.images.length > 0;
-  const button = $('#analyze-btn');
-  button.disabled = state.analyzing || !ready;
-  button.innerHTML = state.analyzing
-    ? '<span class="icon">hourglass_top</span>Analyzing…'
-    : '<span class="icon">auto_awesome</span>Analyze with Claude';
-  $('#analyze-hint').textContent = state.analyzing
-    ? 'Usually takes under a minute.'
-    : ready ? 'Drafts the title, tags and analysis. You review before saving.' : 'Add a screenshot to analyze it.';
-  $('#forget-key').hidden = !hasKey;
-  if (hasKey) $('#claude-key').hidden = true;
+function renderCases() {
+  const { cases } = state;
+  $('#cases').innerHTML = cases.map((c) => `
+    <li><button class="case-row" data-open="${esc(c.id)}">
+      <span class="body2 muted tabular">${esc(c.id)}</span>
+      <span class="t ${c.title ? '' : 'untitled'}">${esc(c.title || (c.analyzing ? 'Waiting for Claude…' : 'Untitled'))}</span>
+      ${statusChip(c)}
+    </button></li>`).join('');
+  $('#cases-empty').hidden = cases.length > 0;
+  const toReview = cases.filter((c) => c.status === 'draft' && !c.analyzing).length;
+  $('#case-count').textContent = cases.length ? `${cases.length} total${toReview ? ` · ${toReview} to review` : ''}` : '';
+}
+
+function renderReview() {
+  renderView();
+  const r = state.review;
+  if (!r) return;
+  const entry = caseById(r.id);
+  const d = r.data;
+  $('#review-id').textContent = r.id;
+  $('#review-title').textContent = d ? (d.title || 'Untitled') : 'Loading…';
+  $('#review-status').innerHTML = entry ? statusChip(entry) : '';
+  $('#review-github').href = state.repo.webUrl(`${CASES_DIR}/${r.folder}`);
+  $('#review-shots').innerHTML = r.images.map((img) => (img.url
+    ? `<figure class="shot"><a href="${img.url}" target="_blank" rel="noopener"><img src="${img.url}" alt="${esc(img.name)}"></a>
+         <div class="meta"><span class="name body2 tabular">${esc(img.name)}</span></div></figure>`
+    : `<figure class="shot"><div class="meta"><span class="name body2 warn-text">${esc(img.name)} is missing</span></div></figure>`)).join('');
+  if (!d) return;
+  $('#f-title').value = d.title || '';
+  $('#f-product').value = d.product || '';
+  $('#f-url').value = d.url || '';
+  $('#f-captured').value = /^\d{4}-\d{2}-\d{2}$/.test(d.captured) ? d.captured : '';
+  renderTags();
+  renderSections();
+  renderChoices();
+  renderReviewActions();
+}
+
+function renderReviewActions() {
+  const r = state.review;
+  if (!r?.data) return;
+  const analyzing = caseById(r.id)?.analyzing;
+  $('#review-form').disabled = analyzing;
+  $('#save-review').disabled = analyzing || state.saving || !r.dirty;
+  $('#mark-reviewed').disabled = analyzing || state.saving;
+  $('#mark-reviewed').hidden = r.data.status !== 'draft';
+  $('#save-review').className = `btn ${r.data.status === 'draft' ? 'btn-outlined' : 'btn-contained'}`;
+  $('#review-note').textContent = analyzing
+    ? 'Claude is still analyzing this case. It opens for editing when the draft is ready.'
+    : state.saving ? 'Saving…' : r.dirty ? 'Unsaved changes.' : r.data.status === 'draft' ? 'Check the draft, write what you like, then mark it reviewed.' : '';
 }
 
 function renderTags() {
-  if (!state.groups.length) {
-    $('#tags').innerHTML = '<p class="body2 faint">Connect to GitHub to load tags.</p>';
-    return;
-  }
+  const tags = state.review.data.tags;
   $('#tags').innerHTML = state.groups.map((g) => {
-    const picked = state.draft.tags[g.key] || [];
+    const picked = tags[g.key] || [];
     const full = g.multi && picked.length >= g.limit;
     const hint = g.hint ? capitalize(g.hint) : (g.multi ? 'Pick any' : 'Pick 1');
     return `<div class="tag-group">
@@ -339,58 +349,21 @@ function renderTags() {
 }
 
 function renderSections() {
+  const values = state.review.data.sections;
   const field = (s) => `<label class="field">
       <span class="label muted">${esc(s.heading)}</span>
-      <textarea class="input" rows="3" data-section="${esc(s.heading)}" placeholder="${esc(s.hint)}">${esc(state.draft.sections[s.heading] || '')}</textarea>
+      <textarea class="input" rows="${MY_SECTIONS.includes(s.heading) ? 3 : 4}" data-section="${esc(s.heading)}" placeholder="${esc(s.hint)}">${esc(values[s.heading] || '')}</textarea>
     </label>`;
-  const empty = '<p class="body2 faint">Connect to GitHub to load the case template.</p>';
-  const mine = state.sections.filter((s) => MY_SECTIONS.includes(s.heading));
-  const drafted = state.sections.filter((s) => !MY_SECTIONS.includes(s.heading));
-  $('#my-sections').innerHTML = state.sections.length ? mine.map(field).join('') : empty;
-  $('#analysis-sections').innerHTML = state.sections.length ? drafted.map(field).join('') : empty;
+  $('#my-sections').innerHTML = state.sections.filter((s) => MY_SECTIONS.includes(s.heading)).map(field).join('');
+  $('#analysis-sections').innerHTML = state.sections.filter((s) => !MY_SECTIONS.includes(s.heading)).map(field).join('');
 }
 
 function renderChoices() {
-  const { fit, rating } = state.draft;
+  const { fit, rating } = state.review.data;
   $('#fit').innerHTML = FIT_OPTIONS
     .map(([v, d]) => `<button type="button" data-fit="${v}" aria-pressed="${fit === v}" title="${esc(d)}">${v}</button>`).join('');
   $('#rating').innerHTML = [1, 2, 3, 4, 5]
     .map((n) => `<button type="button" data-rating="${n}" aria-pressed="${rating === n}" aria-label="Rating ${n}">${n}</button>`).join('');
-}
-
-function renderCases() {
-  const { repo, cases } = state;
-  $('#cases').innerHTML = cases.map((c) => `
-    <li>
-      <span class="body2 muted tabular">${esc(c.id)}</span>
-      <a class="t body2" href="${esc(repo.webUrl(`${CASES_DIR}/${c.folder}`))}" target="_blank" rel="noopener noreferrer" title="${esc(c.title || c.folder)}">${esc(c.title || c.folder)}</a>
-      ${c.status ? `<span class="chip ${STATUS_CHIP[c.status] || 't-neutral'}">${esc(c.status)}</span>` : '<span></span>'}
-    </li>`).join('');
-  $('#cases-empty').hidden = cases.length > 0;
-  $('#cases-empty').textContent = repo ? 'No cases yet.' : 'Connect to GitHub to see cases.';
-  $('#case-count').textContent = cases.length ? `${cases.length} total` : '';
-}
-
-function setStatus(text, warn = false) {
-  $('#status').textContent = text;
-  $('#status').className = `body2 ${warn ? 'warn-text' : 'muted'}`;
-}
-
-function renderStatus() {
-  const c = draftCase();
-  const gaps = missing(c);
-  $('#slug-prefix').textContent = `${CASES_DIR}/${c.id}-`;
-  $('#save').disabled = gaps.length > 0 || state.saving;
-  if (state.saving) return;
-  if (gaps.length) setStatus(`To save: ${gaps.join(', ')}.`);
-  else setStatus(`Ready to save as ${c.id}-${c.slug}${c.url ? '' : ' (no source link)'}.`, !c.url);
-}
-
-function showSaved(id, folder, commitUrl) {
-  $('#next-id').textContent = id;
-  $('#link-folder').href = state.repo.webUrl(folder);
-  $('#link-commit').href = commitUrl;
-  $('#next').hidden = false;
 }
 
 let toastTimer;
@@ -399,25 +372,45 @@ function toast(text) {
   el.textContent = text;
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3200);
+}
+
+/* ---------- Routing: #/ is home, #/case/v-0007 is a review ---------- */
+
+let currentHash = location.hash;
+async function onRoute() {
+  if (state.review?.dirty && !confirm('Discard unsaved changes to this case?')) {
+    history.replaceState(null, '', currentHash);
+    return;
+  }
+  currentHash = location.hash;
+  const id = location.hash.match(/^#\/case\/(v-\d+)/)?.[1];
+  closeReview();
+  if (state.repo && id) await openReview(id);
+  else renderView();
+  window.scrollTo(0, 0);
 }
 
 /* ---------- Events ---------- */
 
+function editReview(change) {
+  change(state.review.data);
+  state.review.dirty = true;
+  renderReviewActions();
+}
+
 async function onConnect() {
   const name = $('#repo-name').value.trim().replace(/^https:\/\/github\.com\//, '').replace(/(\.git|\/)$/, '');
   const token = $('#token').value.trim();
-  const remember = $('#remember').checked;
   if (!/^[\w.-]+\/[\w.-]+$/.test(name)) return banner('error', 'Enter the repository as <code>owner/name</code>.');
   if (!token) return banner('error', 'Paste your fine-grained token.');
   $('#connect-btn').disabled = true;
   try {
     await connect(name, token);
-    session.saveRepo(state.repo.fullName);
-    session.saveSecret(KEYS.token, token, remember);
+    session.save(state.repo.fullName, token, $('#remember').checked);
     $('#token').value = '';
-    banner(state.repo.isPrivate ? undefined : 'warning', `${esc(state.repo.fullName)} is public. Cases and screenshots will be visible to anyone.`);
-    renderAll();
+    banner(state.repo.isPrivate ? undefined : 'warning', `${esc(state.repo.fullName)} is public. Cases and screenshots are visible to anyone.`);
+    await onRoute();
   } catch (e) {
     banner('error', esc(describeError(e)));
   } finally {
@@ -426,80 +419,21 @@ async function onConnect() {
 }
 
 function onSignOut() {
-  session.forget(KEYS.token, KEYS.anthropic);
-  Object.assign(state, { repo: null, template: '', taxonomy: '', groups: [], sections: [], cases: [], nextNumber: 1 });
-  $('#next').hidden = true;
+  session.forget();
+  clearTimeout(pollTimer);
+  closeReview();
+  Object.assign(state, { repo: null, template: '', groups: [], sections: [], cases: [], nextNumber: 1 });
   banner();
-  renderAll();
-}
-
-function onSaveKey() {
-  const key = $('#anthropic-key').value.trim();
-  if (!key) return $('#anthropic-key').focus();
-  session.saveSecret(KEYS.anthropic, key);
-  $('#anthropic-key').value = '';
-  renderAnalyze();
-  analyze();
-}
-
-function onForgetKey() {
-  session.forget(KEYS.anthropic);
-  renderAnalyze();
-  toast('Anthropic API key removed from this browser');
-}
-
-async function onReloadTags() {
-  if (!state.repo) return;
-  try {
-    Object.assign(state, await loadLibrary(state.repo));
-    dropUnknownTags();
-    renderTags();
-    renderSections();
-    toast('Reloaded taxonomy.yml and the case template');
-  } catch (e) {
-    banner('error', esc(describeError(e)));
-  }
-}
-
-function onTagClick(e) {
-  const button = e.target.closest('.tag');
-  if (!button || button.disabled) return;
-  const group = state.groups.find((g) => g.key === button.dataset.group);
-  const picked = state.draft.tags[group.key] || [];
-  const value = button.dataset.value;
-  if (picked.includes(value)) state.draft.tags[group.key] = picked.filter((v) => v !== value);
-  else if (!group.multi) state.draft.tags[group.key] = [value];
-  else if (picked.length < group.limit) state.draft.tags[group.key] = [...picked, value];
-  renderTags();
-  $(`.tag[data-group="${group.key}"][data-value="${value}"]`)?.focus();
-}
-
-function onShotClick(e) {
-  const remove = e.target.closest('[data-remove]');
-  const move = e.target.closest('[data-move]');
-  const { images } = state.draft;
-  if (remove) {
-    URL.revokeObjectURL(images.splice(+remove.dataset.remove, 1)[0].url);
-  } else if (move) {
-    const i = +move.dataset.move;
-    [images[i - 1], images[i]] = [images[i], images[i - 1]];
-  } else return;
-  renderShots();
-  renderAnalyze();
-  renderStatus();
+  renderView();
 }
 
 function bindEvents() {
   $('#connect-btn').addEventListener('click', onConnect);
   $('#token').addEventListener('keydown', (e) => e.key === 'Enter' && onConnect());
   $('#repo').addEventListener('click', (e) => e.target.closest('#sign-out') && onSignOut());
-  $('#reload-tax').addEventListener('click', onReloadTags);
+  window.addEventListener('hashchange', onRoute);
 
-  $('#analyze-btn').addEventListener('click', analyze);
-  $('#save-key').addEventListener('click', onSaveKey);
-  $('#anthropic-key').addEventListener('keydown', (e) => e.key === 'Enter' && onSaveKey());
-  $('#forget-key').addEventListener('click', onForgetKey);
-
+  // New case
   const drop = $('#drop');
   drop.addEventListener('click', () => $('#file').click());
   drop.addEventListener('keydown', (e) => {
@@ -512,13 +446,52 @@ function bindEvents() {
   window.addEventListener('dragover', (e) => e.preventDefault());
   window.addEventListener('drop', (e) => e.preventDefault());
   document.addEventListener('paste', (e) => {
+    if ($('#home').hidden) return;
     const files = [...(e.clipboardData?.items || [])]
       .filter((i) => i.kind === 'file' && i.type.startsWith('image/')).map((i) => i.getAsFile());
     if (files.length) { e.preventDefault(); addImages(files); }
   });
+  $('#shots').addEventListener('click', (e) => {
+    const remove = e.target.closest('[data-remove]');
+    const move = e.target.closest('[data-move]');
+    const images = state.capture;
+    if (remove) URL.revokeObjectURL(images.splice(+remove.dataset.remove, 1)[0].url);
+    else if (move) {
+      const i = +move.dataset.move;
+      [images[i - 1], images[i]] = [images[i], images[i - 1]];
+    } else return;
+    renderCapture();
+  });
+  $('#save-capture').addEventListener('click', saveCapture);
+  $('#url').addEventListener('keydown', (e) => e.key === 'Enter' && saveCapture());
+  $('#cases').addEventListener('click', (e) => {
+    const row = e.target.closest('[data-open]');
+    if (row) location.hash = `#/case/${row.dataset.open}`;
+  });
 
-  $('#shots').addEventListener('click', onShotClick);
-  $('#tags').addEventListener('click', onTagClick);
+  // Review
+  const fields = { '#f-title': 'title', '#f-product': 'product', '#f-url': 'url', '#f-captured': 'captured' };
+  for (const [sel, key] of Object.entries(fields)) {
+    $(sel).addEventListener('input', (e) => editReview((d) => { d[key] = e.target.value.trim(); }));
+  }
+  $('#review-form').addEventListener('input', (e) => {
+    const heading = e.target.dataset?.section;
+    if (heading) editReview((d) => { d.sections[heading] = e.target.value; });
+  });
+  $('#tags').addEventListener('click', (e) => {
+    const button = e.target.closest('.tag');
+    if (!button || button.disabled) return;
+    const group = state.groups.find((g) => g.key === button.dataset.group);
+    const value = button.dataset.value;
+    editReview((d) => {
+      const picked = d.tags[group.key] || [];
+      if (picked.includes(value)) d.tags[group.key] = picked.filter((v) => v !== value);
+      else if (!group.multi) d.tags[group.key] = [value];
+      else if (picked.length < group.limit) d.tags[group.key] = [...picked, value];
+    });
+    renderTags();
+    $(`.tag[data-group="${group.key}"][data-value="${value}"]`)?.focus();
+  });
   const showTagDesc = (e) => {
     const tag = e.target.closest?.('.tag');
     $('#tag-desc').textContent = tag ? `${tag.dataset.value}: ${tag.title}` : '';
@@ -526,68 +499,47 @@ function bindEvents() {
   $('#tags').addEventListener('mouseover', showTagDesc);
   $('#tags').addEventListener('focusin', showTagDesc);
   $('#tags').addEventListener('mouseleave', () => { $('#tag-desc').textContent = ''; });
-
   $('#fit').addEventListener('click', (e) => {
     const b = e.target.closest('[data-fit]');
-    if (b) { state.draft.fit = b.dataset.fit; renderChoices(); }
+    if (b) { editReview((d) => { d.fit = b.dataset.fit; }); renderChoices(); }
   });
   $('#rating').addEventListener('click', (e) => {
     const b = e.target.closest('[data-rating]');
-    if (b) { state.draft.rating = state.draft.rating === +b.dataset.rating ? 0 : +b.dataset.rating; renderChoices(); }
+    if (b) { editReview((d) => { d.rating = d.rating === +b.dataset.rating ? 0 : +b.dataset.rating; }); renderChoices(); }
   });
-
-  $('#title').addEventListener('input', () => {
-    if (!state.draft.slugEdited) $('#slug').value = slugify($('#title').value);
-  });
-  $('#slug').addEventListener('input', () => { state.draft.slugEdited = $('#slug').value.trim() !== ''; });
-  $('#slug').addEventListener('blur', () => { $('#slug').value = slugify($('#slug').value); });
-  $('#case-form').addEventListener('input', (e) => {
-    const heading = e.target.dataset?.section;
-    if (heading) state.draft.sections[heading] = e.target.value;
-    renderStatus();
-  });
-
-  $('#save').addEventListener('click', save);
+  $('#save-review').addEventListener('click', () => saveReview(false));
+  $('#mark-reviewed').addEventListener('click', () => saveReview(true));
   document.addEventListener('keydown', (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); save(); }
-  });
-  $('#preview-btn').addEventListener('click', () => {
-    $('#preview-body').textContent = state.template
-      ? buildCaseMd(state.template, state.groups, draftCase())
-      : 'Connect to GitHub first.';
-    $('#preview').showModal();
-  });
-  $('#preview-close').addEventListener('click', () => $('#preview').close());
-  document.addEventListener('click', async (e) => {
-    const button = e.target.closest('[data-copy]');
-    if (!button) return;
-    try {
-      await navigator.clipboard.writeText($(`#${button.dataset.copy}`).textContent);
-      toast('Copied');
-    } catch {
-      toast('Copy failed. Select the text instead.');
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+      e.preventDefault();
+      if (state.review) saveReview(false); else saveCapture();
     }
   });
-  window.addEventListener('beforeunload', (e) => { if (isDirty()) e.preventDefault(); });
+
+  window.addEventListener('beforeunload', (e) => {
+    if (state.capture.length || state.review?.dirty) e.preventDefault();
+  });
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && state.repo && state.cases.some((c) => c.analyzing)) poll();
+  });
 }
 
 /* ---------- Start ---------- */
 
 async function start() {
-  $('#captured').value = today();
   bindEvents();
   const saved = session.load();
   $('#repo-name').value = saved.repo;
   $('#remember').checked = saved.remember;
-  renderAll();
-  if (!saved.repo || !saved.token) return;
-  setStatus('Connecting…');
-  try {
-    await connect(saved.repo, saved.token);
-  } catch (e) {
-    banner('error', esc(describeError(e)));
+  if (saved.repo && saved.token) {
+    try {
+      await connect(saved.repo, saved.token);
+    } catch (e) {
+      banner('error', esc(describeError(e)));
+    }
   }
-  renderAll();
+  renderCapture();
+  await onRoute();
 }
 
 start();
