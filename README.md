@@ -14,8 +14,10 @@ private library repo.
    one, and **Save**. The page commits them with a case.md to
    `cases/visual/v-0007/` in the library repo.
 2. **Draft.** A GitHub Action in the library repo runs Claude Code on every
-   new capture. It fills in the title, tags and analysis and commits them.
-   The page shows the case as *Analyzing* and refreshes when it's done.
+   new capture. It fills in the title, tags and analysis and commits them,
+   usually within 1–2 minutes. While it runs, the page shows what the run is
+   doing (starting, waiting for GitHub, or analyzing with a timer) with a link
+   to its log, and offers **Retry** if it failed or never started.
 3. **Review.** Open the case, adjust anything, write "What I like", set the
    rating, and **Save as reviewed**.
 
@@ -28,7 +30,9 @@ Create a fine-grained GitHub token:
 
 - GitHub → Settings → Developer settings → Fine-grained tokens → Generate new token
 - Repository access: **Only select repositories** → the library repo
-- Permissions → Add permissions → **Contents: Read and write**
+- Permissions → Add permissions → **Contents** and **Actions**, both
+  **Read and write**. Contents saves cases; Actions shows the analysis
+  progress and lets you retry it. Without Actions, everything else works.
 
 Open the page, enter `owner/repo` and the token, and **Connect**.
 
@@ -67,6 +71,7 @@ No build step and no dependencies.
 | `js/app.js` | State, routing (`#/`, `#/case/v-0007`), rendering and events |
 | `js/library.js` | Pure functions to read and write `taxonomy.yml`, the template and `case.md` |
 | `js/github.js` | All GitHub API calls |
+| `js/runs.js` | Turns the analysis workflow's runs into the status the page shows |
 | `js/images.js` | Image size limit and WebP conversion |
 
 **Releasing:** bump `?v=` on the `app.js` script tag in `index.html`.

@@ -10,14 +10,14 @@ function showStartupError(error) {
 const version = new URL(import.meta.url).search;
 let modules;
 try {
-  modules = await Promise.all(['github', 'images', 'library'].map((name) => import(`./${name}.js${version}`)));
+  modules = await Promise.all(['github', 'images', 'library', 'runs'].map((name) => import(`./${name}.js${version}`)));
 } catch (e) {
   showStartupError(e);
   throw e;
 }
 const [{ LibraryRepo }, { prepareImage, formatBytes, MAX_IMAGE_BYTES }, {
   parseTaxonomy, tagGroups, templateSections, parseCase, writeCase, needsAnalysis, nextCaseNumber, caseId,
-}] = modules;
+}, { analysisState }] = modules;
 
 const CASES_DIR = 'cases/visual';
 const FIT_OPTIONS = [
@@ -32,7 +32,8 @@ const EXTRA_SECTIONS = [
   { heading: 'Open questions', hint: 'What a static screenshot can’t answer, such as interactions.' },
   { heading: 'Suggested new tags', hint: 'Tags that would fit but aren’t in taxonomy.yml yet.' },
 ];
-const POLL_MS = 20000;
+const POLL_MS = 10000;
+const WORKFLOW = 'analyze-cases.yml'; // in the library repo
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -51,6 +52,9 @@ const state = {
   capture: [],         // images for the next case: [{ blob, ext, note, url, original }]
   saving: false,
   review: null,        // { id, folder, md, data, images, dirty }
+  runs: null,          // newest analyze-cases runs while a case waits; null when none waits
+  runsHidden: false,   // the token can't read Actions
+  started: null,       // last capture or retry from here: { at, afterRunId } (see runs.js)
 };
 
 const headings = () => state.sections.map((s) => s.heading);
@@ -119,13 +123,47 @@ async function connect(repoName, token) {
   await refreshCases();
 }
 
-// Re-reads the case list; keeps checking while any case is being analyzed.
+// Re-reads the case list, and the analysis runs while a case waits for
+// its draft. Keeps checking until nothing waits.
 let pollTimer;
 async function refreshCases() {
   clearTimeout(pollTimer);
   Object.assign(state, await loadCases(state.repo, analysisHeadings()));
+  await loadRuns();
   renderCases();
-  if (state.cases.some((c) => c.analyzing)) pollTimer = setTimeout(poll, POLL_MS);
+  renderAnalysis();
+  if (state.runs) pollTimer = setTimeout(poll, POLL_MS);
+}
+
+async function loadRuns() {
+  if (!state.cases.some((c) => c.analyzing)) { state.runs = null; return; }
+  try {
+    state.runs = await state.repo.workflowRuns(WORKFLOW);
+    state.runsHidden = false;
+  } catch (e) {
+    if (e.status !== 403 && e.status !== 404) throw e;
+    state.runs = [];
+    state.runsHidden = true; // the page still works; it just can't show progress
+  }
+}
+
+// Remembers the newest run before starting one, so the page can tell when
+// the new run shows up.
+async function markStarted() {
+  const runs = await state.repo.workflowRuns(WORKFLOW).catch(() => []);
+  return { at: Date.now(), afterRunId: runs[0]?.id ?? null };
+}
+
+async function retryAnalysis() {
+  try {
+    const started = await markStarted();
+    await state.repo.dispatchWorkflow(WORKFLOW);
+    state.started = started;
+    renderAnalysis();
+    pollTimer = setTimeout(poll, 3000);
+  } catch (e) {
+    banner('error', `Couldn’t start the analysis. ${esc(e.status === 403 ? 'The token needs Actions: Read and write.' : describeError(e))}`);
+  }
 }
 
 async function poll() {
@@ -171,6 +209,7 @@ async function saveCapture() {
     const folder = `${CASES_DIR}/${id}`; // Claude adds a short name after analyzing
     const names = images.map(shotName);
     const md = writeCase(state.template, state.groups, { id, url: $('#url').value.trim(), captured: today(), images: names });
+    const started = await markStarted();
     await state.repo.commit([
       ...images.map((img, i) => ({ path: `${folder}/${names[i]}`, content: img.blob })),
       { path: `${folder}/case.md`, content: md },
@@ -179,7 +218,8 @@ async function saveCapture() {
     state.capture = [];
     $('#url').value = '';
     banner();
-    toast(`Saved ${id}. Claude is analyzing it; this takes a few minutes.`);
+    state.started = started;
+    toast(`Saved ${id}. Claude is analyzing it.`);
     await refreshCases();
   } catch (e) {
     banner('error', `Not saved. ${esc(describeError(e))}`);
@@ -306,6 +346,45 @@ function renderCases() {
   $('#case-count').textContent = cases.length ? `${cases.length} total${toReview ? ` · ${toReview} to review` : ''}` : '';
 }
 
+const elapsed = (ms) => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+};
+
+// What the analysis is doing right now, for the case list and an open case.
+function analysisHtml() {
+  if (!state.runs) return '';
+  if (state.runsHidden) {
+    return `<p class="analysis-line muted"><span class="icon">info</span><span>Claude is analyzing new cases.
+      To see its progress here, give your GitHub token <b>Actions: Read and write</b>.</span></p>`;
+  }
+  const now = Date.now();
+  const { state: st, since, url } = analysisState(state.runs, { now, started: state.started });
+  const log = url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${st === 'running' ? 'Live log' : 'View log'}</a>` : '';
+  const retry = '<button type="button" class="btn btn-text btn-inline" data-retry>Retry</button>';
+  const working = (text) => `<p class="analysis-line"><span class="icon spin">progress_activity</span><span>${text}</span>${log}</p>`;
+  switch (st) {
+    case 'starting': return working('Starting the analysis…');
+    case 'queued': return working('Waiting for GitHub to start the analysis…');
+    case 'running': return working(`Claude is analyzing · <span class="tabular">${elapsed(now - since)}</span> <span class="faint">Usually 1–2 minutes.</span>`);
+    case 'failed': return `<div class="alert t-error analysis-line"><span class="icon">error</span><span>The analysis failed.</span>${log}${retry}</div>`;
+    default: return `<div class="alert t-warning analysis-line"><span class="icon">warning</span><span>The analysis didn’t run.</span>${log}${retry}</div>`;
+  }
+}
+
+// Writes only when the text changed, so the 1-second timer doesn't disturb focus.
+function renderAnalysis() {
+  const html = analysisHtml();
+  const reviewWaiting = state.review && caseById(state.review.id)?.analyzing;
+  for (const [el, show] of [[$('#analysis-home'), true], [$('#analysis-review'), reviewWaiting]]) {
+    const next = show ? html : '';
+    if (el.dataset.html !== next) {
+      el.innerHTML = next;
+      el.dataset.html = next;
+    }
+  }
+}
+
 function renderReview() {
   renderView();
   const r = state.review;
@@ -329,6 +408,7 @@ function renderReview() {
   renderSections();
   renderChoices();
   renderReviewActions();
+  renderAnalysis();
 }
 
 function renderReviewActions() {
@@ -341,7 +421,7 @@ function renderReviewActions() {
   $('#mark-reviewed').hidden = r.data.status !== 'draft';
   $('#save-review').className = `btn ${r.data.status === 'draft' ? 'btn-outlined' : 'btn-contained'}`;
   $('#review-note').textContent = analyzing
-    ? 'Claude is still analyzing this case. It opens for editing when the draft is ready.'
+    ? 'Opens for editing when Claude’s draft is ready.'
     : state.saving ? 'Saving…' : r.dirty ? 'Unsaved changes.' : r.data.status === 'draft' ? 'Check the draft, write what you like, then mark it reviewed.' : '';
 }
 
@@ -436,6 +516,7 @@ async function onConnect() {
 function onSignOut() {
   session.forget();
   clearTimeout(pollTimer);
+  state.runs = null;
   closeReview();
   Object.assign(state, { repo: null, template: '', groups: [], sections: [], cases: [], nextNumber: 1 });
   banner();
@@ -534,6 +615,8 @@ function bindEvents() {
   window.addEventListener('beforeunload', (e) => {
     if (state.capture.length || state.review?.dirty) e.preventDefault();
   });
+  document.addEventListener('click', (e) => { if (e.target.closest('[data-retry]')) retryAnalysis(); });
+  setInterval(() => { if (state.runs && !document.hidden) renderAnalysis(); }, 1000);
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && state.repo && state.cases.some((c) => c.analyzing)) poll();
   });

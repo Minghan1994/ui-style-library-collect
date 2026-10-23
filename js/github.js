@@ -97,6 +97,22 @@ export class LibraryRepo {
     throw new GitHubError(409, 'The branch kept changing while saving. Try again.');
   }
 
+  /** Newest runs of a workflow file on the default branch (needs Actions: read). */
+  async workflowRuns(workflow, count = 5) {
+    const res = await this.#request(
+      `/repos/${this.fullName}/actions/workflows/${workflow}/runs?branch=${encodeURIComponent(this.branch)}&per_page=${count}`,
+    );
+    return res.workflow_runs;
+  }
+
+  /** Starts a workflow run on the default branch (needs Actions: write). */
+  async dispatchWorkflow(workflow) {
+    await this.#request(`/repos/${this.fullName}/actions/workflows/${workflow}/dispatches`, {
+      method: 'POST',
+      body: { ref: this.branch },
+    });
+  }
+
   // as: 'json' (default), or 'text' / 'blob' for a file's raw contents.
   async #request(path, { method = 'GET', body, as = 'json' } = {}) {
     const res = await fetch(API + path, {
@@ -114,7 +130,7 @@ export class LibraryRepo {
       const data = await res.json().catch(() => ({}));
       throw new GitHubError(res.status, data.message || res.statusText);
     }
-    return res[as]();
+    return res.status === 204 ? null : res[as]();
   }
 }
 

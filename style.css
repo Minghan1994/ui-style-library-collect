@@ -201,3 +201,10 @@ fieldset.plain:disabled { opacity: 0.6; }
 .spin { animation: spin 1.2s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } }
+
+/* Analysis progress */
+.analysis-line { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; margin: 0 0 12px; font-size: 13px; line-height: 18px; }
+.analysis-line .icon { font-size: 18px; color: var(--t2); }
+.alert.analysis-line { padding: 10px 12px; }
+#analysis-review:empty { display: none; }
+#analysis-review .analysis-line { margin: 0; }
