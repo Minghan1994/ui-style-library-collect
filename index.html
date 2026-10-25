@@ -11,7 +11,7 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..24,400,0,0">
 <link rel="stylesheet" href="style.css">
 <!-- Bump ?v= on every release; app.js loads the other modules with the same version. -->
-<script type="module" src="js/app.js?v=3"></script>
+<script type="module" src="js/app.js?v=4"></script>
 </head>
 <body>
 <div class="page narrow">
@@ -81,7 +81,13 @@
     <section class="card" aria-labelledby="h-cases">
       <div class="card-head tight">
         <h2 class="h5" id="h-cases">Cases</h2>
-        <span id="case-count" class="caption muted tabular"></span>
+        <div class="row">
+          <span id="case-count" class="caption muted tabular"></span>
+          <div class="seg seg-icons" id="cases-view" role="group" aria-label="Show cases as" hidden>
+            <button type="button" data-view="grid" aria-label="Grid" title="Grid"><span class="icon">grid_view</span></button>
+            <button type="button" data-view="list" aria-label="List" title="List"><span class="icon">view_list</span></button>
+          </div>
+        </div>
       </div>
       <div id="analysis-home"></div>
       <ul id="cases" class="list"></ul>

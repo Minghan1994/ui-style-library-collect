@@ -18,8 +18,9 @@ private library repo.
    usually within 1–2 minutes. While it runs, the page shows what the run is
    doing (starting, waiting for GitHub, or analyzing with a timer) with a link
    to its log, and offers **Retry** if it failed or never started.
-3. **Review.** Open the case, adjust anything, write "What I like", set the
-   rating, and **Save as reviewed**.
+3. **Review.** Pick a case from the grid of screenshots (or the list view,
+   with thumbnails), adjust anything, write "What I like", set the rating,
+   and **Save as reviewed**.
 
 The page itself never calls Claude. The drafting setup lives in the library
 repo (`.claude/skills/analyze-cases/` and `.github/workflows/analyze-cases.yml`).
@@ -49,6 +50,10 @@ Open the page, enter `owner/repo` and the token, and **Connect**.
 - **One commit per action**, through the GitHub Git Data API. The next case
   number is read from the repo right before each capture.
 - **Images stay small.** Screenshots over 1 MB are re-encoded as WebP.
+- **Thumbnails load once.** Case covers load as they scroll into view, are
+  shrunk to 480 px wide, and are kept in the browser's cache under the
+  file's git blob id, so they never go stale and later visits download
+  nothing.
 
 ## Security
 
@@ -72,6 +77,7 @@ No build step and no dependencies.
 | `js/library.js` | Pure functions to read and write `taxonomy.yml`, the template and `case.md` |
 | `js/github.js` | All GitHub API calls |
 | `js/runs.js` | Turns the analysis workflow's runs into the status the page shows |
+| `js/thumbs.js` | Case cover thumbnails, cached by git blob id |
 | `js/images.js` | Image size limit and WebP conversion |
 
 **Releasing:** bump `?v=` on the `app.js` script tag in `index.html`.

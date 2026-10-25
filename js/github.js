@@ -46,11 +46,14 @@ export class LibraryRepo {
     return `/repos/${this.fullName}/contents/${encoded}?ref=${encodeURIComponent(this.branch)}`;
   }
 
-  /** Every folder in `dir` with the text of its case.md, in one GraphQL call. */
+  /**
+   * Every folder in `dir` with the text of its case.md and the git blob id
+   * of each file, in one GraphQL call. → [{ name, caseMd, files: { name: oid } }]
+   */
   async listFolders(dir) {
     const [owner, name] = this.fullName.split('/');
     const query = `query($o:String!,$n:String!,$e:String!){repository(owner:$o,name:$n){object(expression:$e){
-      ... on Tree{entries{name type object{... on Tree{entries{name object{... on Blob{text}}}}}}}}}}`;
+      ... on Tree{entries{name type object{... on Tree{entries{name object{... on Blob{oid text}}}}}}}}}}`;
     const res = await this.#request('/graphql', {
       method: 'POST',
       body: { query, variables: { o: owner, n: name, e: `${this.branch}:${dir}` } },
@@ -58,10 +61,14 @@ export class LibraryRepo {
     if (res.errors?.length) throw new GitHubError(0, res.errors[0].message);
     return (res.data?.repository?.object?.entries || [])
       .filter((e) => e.type === 'tree')
-      .map((e) => ({
-        name: e.name,
-        caseMd: e.object?.entries?.find((f) => f.name === 'case.md')?.object?.text || '',
-      }));
+      .map((e) => {
+        const entries = e.object?.entries || [];
+        return {
+          name: e.name,
+          caseMd: entries.find((f) => f.name === 'case.md')?.object?.text || '',
+          files: Object.fromEntries(entries.map((f) => [f.name, f.object?.oid])),
+        };
+      });
   }
 
   /**

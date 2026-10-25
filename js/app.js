@@ -10,14 +10,14 @@ function showStartupError(error) {
 const version = new URL(import.meta.url).search;
 let modules;
 try {
-  modules = await Promise.all(['github', 'images', 'library', 'runs'].map((name) => import(`./${name}.js${version}`)));
+  modules = await Promise.all(['github', 'images', 'library', 'runs', 'thumbs'].map((name) => import(`./${name}.js${version}`)));
 } catch (e) {
   showStartupError(e);
   throw e;
 }
 const [{ LibraryRepo }, { prepareImage, formatBytes, MAX_IMAGE_BYTES }, {
   parseTaxonomy, tagGroups, templateSections, parseCase, writeCase, needsAnalysis, nextCaseNumber, caseId,
-}, { analysisState }] = modules;
+}, { analysisState }, { thumbnail, readyThumbnail }] = modules;
 
 const CASES_DIR = 'cases/visual';
 const FIT_OPTIONS = [
@@ -55,7 +55,12 @@ const state = {
   runs: null,          // newest analyze-cases runs while a case waits; null when none waits
   runsHidden: false,   // the token can't read Actions
   started: null,       // last capture or retry from here: { at, afterRunId } (see runs.js)
+  view: loadView(),    // how the case list looks: 'grid' or 'list'
 };
+
+function loadView() {
+  try { return localStorage.getItem('collect.cases-view') === 'list' ? 'list' : 'grid'; } catch { return 'grid'; }
+}
 
 const headings = () => state.sections.map((s) => s.heading);
 const analysisHeadings = () => headings().filter((h) => !MY_SECTIONS.includes(h));
@@ -111,7 +116,12 @@ async function loadCases(repo, analysis) {
   const cases = folders
     .map((f) => {
       const c = parseCase(f.caseMd);
-      return { folder: f.name, id: f.name.match(/^v-\d+/)[0], title: c.title, status: c.status, analyzing: needsAnalysis(f.caseMd, analysis) };
+      const cover = c.images.find((name) => f.files[name]); // the first screenshot that exists
+      return {
+        folder: f.name, id: f.name.match(/^v-\d+/)[0], title: c.title, status: c.status,
+        analyzing: needsAnalysis(f.caseMd, analysis),
+        cover: cover && { path: `${CASES_DIR}/${f.name}/${cover}`, oid: f.files[cover] },
+      };
     })
     .sort((a, b) => b.folder.localeCompare(a.folder));
   return { cases, nextNumber: nextCaseNumber(folders.map((f) => f.name)) };
@@ -334,16 +344,49 @@ function renderCapture() {
 }
 
 function renderCases() {
-  const { cases } = state;
-  $('#cases').innerHTML = cases.map((c) => `
-    <li><button class="case-row" data-open="${esc(c.id)}">
-      <span class="body2 muted tabular">${esc(c.id)}</span>
-      <span class="t ${c.title ? '' : 'untitled'}">${esc(c.title || (c.analyzing ? 'Waiting for Claude…' : 'Untitled'))}</span>
-      ${statusChip(c)}
-    </button></li>`).join('');
+  const { cases, view } = state;
+  const list = $('#cases');
+  list.className = view === 'grid' ? 'case-grid' : 'list';
+  list.innerHTML = cases.map((c) => {
+    const title = `<span class="t ${c.title ? '' : 'untitled'}">${esc(c.title || (c.analyzing ? 'Waiting for Claude…' : 'Untitled'))}</span>`;
+    const id = `<span class="body2 muted tabular">${esc(c.id)}</span>`;
+    return view === 'grid'
+      ? `<li><button class="case-card" data-open="${esc(c.id)}">${coverHtml(c)}
+          <span class="case-meta"><span class="case-line">${id}${statusChip(c)}</span>${title}</span></button></li>`
+      : `<li><button class="case-row" data-open="${esc(c.id)}">${coverHtml(c)}${id}${title}${statusChip(c)}</button></li>`;
+  }).join('');
+  list.querySelectorAll('img[data-oid]').forEach((img) => coverObserver.observe(img));
   $('#cases-empty').hidden = cases.length > 0;
+  $('#cases-view').hidden = cases.length === 0;
+  for (const b of document.querySelectorAll('#cases-view [data-view]')) b.setAttribute('aria-pressed', b.dataset.view === view);
   const toReview = cases.filter((c) => c.status === 'draft' && !c.analyzing).length;
   $('#case-count').textContent = cases.length ? `${cases.length} total${toReview ? ` · ${toReview} to review` : ''}` : '';
+}
+
+// The first screenshot, from the thumbnail cache when it's ready, else
+// loaded when it scrolls into view.
+function coverHtml(c) {
+  if (!c.cover) return '<span class="cover empty"><span class="icon">image</span></span>';
+  const src = readyThumbnail(c.cover.oid);
+  return src
+    ? `<span class="cover"><img src="${src}" alt=""></span>`
+    : `<span class="cover"><img data-oid="${esc(c.cover.oid)}" data-path="${esc(c.cover.path)}" alt=""></span>`;
+}
+
+const coverObserver = new IntersectionObserver((entries) => {
+  for (const { target, isIntersecting } of entries) {
+    if (!isIntersecting) continue;
+    coverObserver.unobserve(target);
+    thumbnail(target.dataset.oid, () => state.repo.readBlob(target.dataset.path))
+      .then((url) => { target.src = url; })
+      .catch(() => target.parentElement.classList.add('empty'));
+  }
+}, { rootMargin: '300px' });
+
+function setView(view) {
+  state.view = view;
+  try { localStorage.setItem('collect.cases-view', view); } catch { /* not remembered */ }
+  renderCases();
 }
 
 const elapsed = (ms) => {
@@ -560,6 +603,10 @@ function bindEvents() {
   });
   $('#save-capture').addEventListener('click', saveCapture);
   $('#url').addEventListener('keydown', (e) => e.key === 'Enter' && saveCapture());
+  $('#cases-view').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-view]');
+    if (b) setView(b.dataset.view);
+  });
   $('#cases').addEventListener('click', (e) => {
     const row = e.target.closest('[data-open]');
     if (row) location.hash = `#/case/${row.dataset.open}`;
