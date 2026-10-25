@@ -9,9 +9,10 @@
 <title>UI Style Library</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..24,400,0,0">
-<link rel="stylesheet" href="style.css">
-<!-- Bump ?v= on every release; app.js loads the other modules with the same version. -->
-<script type="module" src="js/app.js?v=5"></script>
+<!-- Release version: bump ?v= on both tags together. app.js loads the other
+     modules with the same version, so a deploy never mixes cached files. -->
+<link rel="stylesheet" href="style.css?v=6">
+<script type="module" src="js/app.js?v=6"></script>
 </head>
 <body>
 <div class="page narrow">

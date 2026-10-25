@@ -80,9 +80,9 @@ No build step and no dependencies.
 | `js/thumbs.js` | Case cover thumbnails, cached by git blob id |
 | `js/images.js` | Image size limit and WebP conversion |
 
-**Releasing:** bump `?v=` on the `app.js` script tag in `index.html`.
-`app.js` loads the other modules with the same version, so browsers never
-mix cached and fresh files after a deploy.
+**Releasing:** bump `?v=` on both the `style.css` and `app.js` tags in
+`index.html`. `app.js` loads the other modules with the same version, so
+browsers never mix cached and fresh files after a deploy.
 
 Run the tests (Node 20+):
 
