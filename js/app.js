@@ -316,11 +316,18 @@ function renderView() {
     : '';
 }
 
+// → [label, chip class]
+function caseStatus(c) {
+  if (c.analyzing) return ['Analyzing', 't-neutral'];
+  if (c.status === 'draft') return ['To review', 't-info'];
+  if (c.status === 'reviewed') return ['Reviewed', 't-success'];
+  return [capitalize(c.status || 'unknown'), 't-neutral'];
+}
+
 function statusChip(c) {
-  if (c.analyzing) return '<span class="chip t-neutral"><span class="icon spin">progress_activity</span>Analyzing</span>';
-  if (c.status === 'draft') return '<span class="chip t-info">To review</span>';
-  if (c.status === 'reviewed') return '<span class="chip t-success">Reviewed</span>';
-  return `<span class="chip t-neutral">${esc(capitalize(c.status || 'unknown'))}</span>`;
+  const [label, tone] = caseStatus(c);
+  const icon = c.analyzing ? '<span class="icon spin">progress_activity</span>' : '';
+  return `<span class="chip ${tone}">${icon}${esc(label)}</span>`;
 }
 
 function renderCapture() {
@@ -351,8 +358,9 @@ function renderCases() {
     const title = `<span class="t ${c.title ? '' : 'untitled'}">${esc(c.title || (c.analyzing ? 'Waiting for Claude…' : 'Untitled'))}</span>`;
     const id = `<span class="body2 muted tabular">${esc(c.id)}</span>`;
     return view === 'grid'
-      ? `<li><button class="case-card" data-open="${esc(c.id)}">${coverHtml(c)}
-          <span class="case-meta"><span class="case-line">${id}${statusChip(c)}</span>${title}</span></button></li>`
+      // Image only; the details show on hover or keyboard focus, and in the label.
+      ? `<li><button class="case-card" data-open="${esc(c.id)}" aria-label="${esc(`${c.id} ${c.title || 'Untitled'}, ${caseStatus(c)[0]}`)}">${coverHtml(c)}
+          <span class="case-meta" aria-hidden="true"><span class="case-line">${id}${statusChip(c)}</span>${title}</span></button></li>`
       : `<li><button class="case-row" data-open="${esc(c.id)}">${coverHtml(c)}${id}${title}${statusChip(c)}</button></li>`;
   }).join('');
   list.querySelectorAll('img[data-oid]').forEach((img) => coverObserver.observe(img));

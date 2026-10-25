@@ -18,8 +18,8 @@ private library repo.
    usually within 1–2 minutes. While it runs, the page shows what the run is
    doing (starting, waiting for GitHub, or analyzing with a timer) with a link
    to its log, and offers **Retry** if it failed or never started.
-3. **Review.** Pick a case from the grid of screenshots (or the list view,
-   with thumbnails), adjust anything, write "What I like", set the rating,
+3. **Review.** Pick a case from the grid of screenshots (hover a card for its
+   id, title and status) or from the list view with thumbnails, adjust anything, write "What I like", set the rating,
    and **Save as reviewed**.
 
 The page itself never calls Claude. The drafting setup lives in the library

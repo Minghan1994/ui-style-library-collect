@@ -218,13 +218,22 @@ fieldset.plain:disabled { opacity: 0.6; }
 .case-grid { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
 @media (max-width: 480px) { .case-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; } }
 .case-card {
-  display: flex; flex-direction: column; width: 100%; padding: 0; overflow: hidden; cursor: pointer; text-align: left;
+  position: relative; display: block; width: 100%; padding: 0; overflow: hidden; cursor: pointer; text-align: left;
   border: 1px solid var(--border); border-radius: var(--r-md); background: var(--s2); color: var(--t1); font: 400 14px/20px Inter, sans-serif;
 }
 .case-card:hover { border-color: var(--border-strong); }
 .case-card:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-.case-card .cover { aspect-ratio: 4 / 3; border-bottom: 1px solid var(--border); }
-.case-meta { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px 12px; min-width: 0; }
+.case-card .cover { aspect-ratio: 4 / 3; }
+/* Details overlay the bottom of the image on hover or keyboard focus. */
+.case-meta {
+  position: absolute; left: 0; right: 0; bottom: 0; display: flex; flex-direction: column; gap: 6px; min-width: 0;
+  padding: 10px 12px 12px; background: var(--s3); border-top: 1px solid var(--border);
+  opacity: 0; transition: opacity .12s;
+}
+.case-card:focus-visible .case-meta { opacity: 1; }
+/* Touch screens keep :hover on the last tapped card, so reveal on hover only with a mouse. */
+@media (hover: hover) { .case-card:hover .case-meta { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .case-meta { transition: none; } }
 .case-line { display: flex; align-items: center; justify-content: space-between; gap: 8px; white-space: nowrap; }
 .case-meta .t { font-size: 13px; line-height: 18px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .seg-icons button { min-width: 34px; height: 30px; padding: 0 6px; display: inline-grid; place-items: center; }
